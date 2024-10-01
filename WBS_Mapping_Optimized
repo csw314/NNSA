@@ -1,0 +1,368 @@
+# Author: Cam Webster
+# Date: 06/07/2024
+
+# ------------------------------------------------------------------------------
+# ---------- attach packages and source mapping engine--------------------------
+library(readxl)
+library(stringr)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(DBI)
+library(odbc)
+library(data.table)
+library(janitor)
+# ------------------------------------------------------------------------------
+# ---------- Generate Global Functions------------------------------------------
+
+### Purpose:
+# Provided a vector of character string items, locate and record all instances
+# of such items in another vector of character string items. 
+
+### Function Parameters:
+# search_range: a vector, with character string data type.
+# search_words: a vector, with character string data type.
+# ignore_case: a boolean, to instruct function to ignore case when necessary. 
+
+### Dependencies: 
+# this function requires open source packages to execute. 
+# run the following line if you haven't already installed the 'stringr' package. 
+# install.packages("stringr")
+# source the mapping engine script for function to perform mapping. 
+mapping_engine_optimized <- function(search_range = NULL, search_words = NULL, ignore_case = FALSE){
+  # ensure valid input parameters
+  if(is.null(search_range)){ stop("No search_range provided") }
+  if(is.null(search_words)){ stop("No search_words provided") }
+  if(!is.character(search_range)){ stop("invalid data type: search_range") }
+  if(!is.character(search_words)){ stop("invalid data type: search_words") }
+  # Remove duplicate search words
+  search_words <- unique(search_words)
+  # Handle case insensitivity
+  if(ignore_case){
+    search_range <- tolower(search_range)
+    search_words <- tolower(search_words)
+  }
+  n <- length(search_range)
+  m <- length(search_words)
+  # Initialize the result vector
+  engine_output <- vector("character", n)
+  # Check for each word in search_range and concatenate results
+  for (i in 1:m) {
+    keyword <- search_words[i]
+    # Detect occurrences of the current keyword
+    matches <- str_detect(search_range, keyword)
+    # Update engine_output where matches are found
+    engine_output[matches] <- paste(engine_output[matches], sprintf("'%s'", keyword), sep = " ")
+  }
+  # Trim excess spaces
+  engine_output <- str_squish(engine_output)
+  # Prepare the result data frame
+  df <- data.frame(search_range = search_range, engine_output = engine_output, stringsAsFactors = FALSE)
+  return(df)
+}
+
+# example_words <- c("apple", "banana", "grape", "apple")
+# example_range <- c("nothing to see here", "monkey love banana",
+#                    "apples and grapes are healthy", "nothing to see here",
+#                    "an apple a day keeps the doctor away", "apple", "nothing to see here")
+# example_output <- mapping_engine_optimized(search_range = example_range, search_words = example_words)
+# print(example_words)
+# print(example_range)
+# print(example_output)
+
+
+# Function to recursively get concatenated WBS names limited to two levels
+get_wbs_concat <- function(wbs, parsid, lookup_table, levels) {
+  # Check if the 'wbs' is either NA, empty, or if the remaining levels are 0 or less.
+  # If any of these conditions are met, return an empty string.
+  if (is.na(wbs) || wbs == "" || levels <= 0) return("")
+  # Retrieve the current WBS element using 'wbs' and 'parsid' from the lookup table.
+  # 'lookup_table' is expected to be a nested list or structure where 'parsid' and 'wbs'
+  # are keys to access the current WBS element.
+  current <- lookup_table[[as.character(parsid)]][[wbs]]
+  # If the 'current' WBS element is NULL, return an empty string.
+  if (is.null(current)) return("")
+  # Extract the parent WBS element from the current WBS entry.
+  parent <- current$parent
+  # Recursively call the function to get the concatenated name of the parent WBS element,
+  # reducing the level count by 1.
+  parent_concat <- get_wbs_concat(parent, parsid, lookup_table, levels - 1)
+  # If a non-NA and non-empty concatenated parent name is returned,
+  # concatenate the current WBS element's name with the parent's concatenated name using " || " as a separator.
+  if (!is.na(parent_concat) && parent_concat != "") {
+    return(paste(current$element, parent_concat, sep = " || "))
+  # If there is no valid parent concatenation, return only the current WBS element's name.
+  } else {
+    return(current$element)
+  }
+}
+
+# Main function to add wbs_concat column
+add_wbs_concat <- function(df) {
+  # Sort the dataframe by project_id and wbs_level
+  df <- df %>% arrange(parsid, wbs_level)
+  # Create a look-up table
+  lookup_table <- list()
+  for (i in 1:nrow(df)) {
+    # Convert the current row's 'parsid' to a character string.
+    parsid <- as.character(df$parsid[i])
+    # If the lookup table doesn't already have an entry for this 'parsid',
+    # create an empty list for it.
+    if (is.null(lookup_table[[parsid]])) {
+      lookup_table[[parsid]] <- list()
+    }
+    # For the current 'wbs' element in the row, store its clean title and parent WBS in the lookup table.
+    lookup_table[[parsid]][[df$wbs[i]]] <- list(
+      element = df$wbs_title_clean[i],
+      parent = df$parent_wbs[i]
+    )
+  }
+  # Add a new column 'wbs_concat' to the dataframe by applying the 'get_wbs_concat' function to each row.
+  df$wbs_concat <- sapply(1:nrow(df), function(i) {
+    # Retrieve the 'parsid' and 'wbs' for the current row.
+    parsid <- as.character(df$parsid[i])
+    wbs <- df$wbs[i]
+    # Call the 'get_wbs_concat' function for the current WBS element,
+    # with a level limit of 3 (can be customized based on the desired depth).
+    get_wbs_concat(wbs, parsid, lookup_table, 3)
+  })
+  return(df)
+}
+
+# function to replace substring if pattern matches. 
+replace_substrings <- function(strings, pattern1, pattern2, replacement) {
+  # define the combined pattern to check for both substrings
+  combined_pattern <- paste0("(?=.*", pattern1, ")(?=.*", pattern2, ")")
+  # use grepl to find the indices of strings that match the pattern
+  matching_indicies <- grepl(combined_pattern, strings, perl = TRUE)
+  # for string that match, replace the substrings
+  strings[matching_indicies] <- sapply(strings[matching_indicies], function(x) {
+    # remove both substrings and replace with the single replacement string
+    x <- gsub(pattern1, "", x)
+    x <- gsub(pattern2, "", x)
+    # trim any extra spaces and add the replacement string
+    paste(trimws(x), replacement)
+  })
+  return(strings)
+}
+# ------------------------------------------------------------------------------
+# ---------- Load data from Vega SQL server and Excel --------------------------
+
+# read in keyword list
+keywords_dir <- "O:/NA-1.3/Cost Evaluation - Projects/Consolidated Data/Modern R Scripts/Finalized Scripts/Mapping Cost Categories/EVM Mapping Script Keyword List.xlsx"
+keywords <- read_excel(paste0(keywords_dir), sheet = "New L2 Keywords")
+
+# connect to Vega SQL Server
+con <- DBI::dbConnect(odbc::odbc(),
+                      driver = "ODBC Driver 17 for SQL Server",
+                      database = "VEGA_PROD", # name of database
+                      server = "132.172.29.102", # SQL server number
+                      uid = "", #enter your SQL Server username in the quotes
+                      pwd = "", #enter your SQL Server password in the quotes
+                      port = 1433)
+
+# write Sql query to pull spae table from vega. 
+sql_query <- "SELECT LHS.parsid AS parsid, parent_wbs, wbs, wbs_title, wbs_level
+FROM (SELECT DISTINCT parsid, cpp_status_date, parent_wbs, wbs, wbs_title, wbs_level
+FROM pars_spae) AS LHS
+INNER JOIN pars_most_recent_cpp AS RHS
+ON (LHS.parsid = RHS.parsid AND LHS.cpp_status_date = RHS.cpp_status_date_recent)"
+
+# Fetch spae data from SQL, with error handling
+spae <- tryCatch({
+  dbGetQuery(con, sql_query)
+}, error = function(e) {
+  message("Error in fetching data: ", e$message)
+  return(NULL)
+})
+if(is.null(spae)) stop("SQL data retrieval failed, exiting script.")
+
+# ------------------------------------------------------------------------------
+# ---------- Data Pre-processing ------------------------------------------------
+
+# clean column names in keywords DF
+names(keywords) <- tolower(names(keywords))
+keywords <- janitor::clean_names(keywords)
+
+# Clean column names
+spae <- spae %>% replace_na(list(wbs_title = "")) %>% janitor::clean_names()
+
+# Clean WBS titles for keyword matching
+spae$wbs_title_clean <- spae$wbs_title %>%
+  tolower() %>%
+  str_replace_all("[^[:alnum:]]", " ") %>%
+  str_squish()
+
+# Store WBS level 1 for later
+spae_l1 <- spae %>%
+  filter(wbs_level == 1) %>%
+  select(parsid, parent_wbs, wbs, wbs_title, wbs_level, wbs_title_clean)
+spae_l1$wbs_concat <- spae_l1$wbs_title_clean
+
+# Filter out level 1 WBS elements from spae for now
+spae <- spae %>%
+  filter(wbs_level != 1) %>%
+  filter(!is.na(wbs_title))
+
+# Concatenate WBS title strings
+spae <- add_wbs_concat(spae)
+
+# Add back level 1 WBS elements and sort by parsid and wbs
+spae <- rbind(spae, spae_l1) %>% arrange(parsid, wbs)
+
+# ------------------------------------------------------------------------------
+# ---------- Perform Cost Category Mapping -------------------------------------
+
+# initialize identified keywords and l2 mapping vectors
+identified_keywords <- as.vector(rep("", nrow(spae)))
+l2 <- as.vector(rep("", nrow(spae)))
+
+# map L2 keywords
+for(cat in 1:length(names(keywords))) {
+  print(paste("now mapping:", names(keywords)[cat]))
+  # get vector of words from current keyword category
+  words <- as.vector(keywords[[cat]]) %>% na.omit()
+  # run mapping engine on current keyword category
+  output <- mapping_engine_optimized(spae$wbs_concat, words, ignore_case = TRUE)
+  # create vector of category mappings
+  category <- as.vector(output[,2])
+  category[category != ""] <- names(keywords)[cat]
+  # Concatenate identified words and category mappings
+  identified_keywords <- as.vector(paste(identified_keywords, output[, 2])) %>% str_squish()
+  l2 <- as.vector(paste(l2, category)) %>% str_squish()
+}
+
+# attach identified keywords + L2 mapping to spae DF
+spae$identified_keywords <- identified_keywords
+spae$l2 <- l2
+
+# create a DF for the L1 keyword consolidation plan. 
+l1_keywords <- data.frame(d_and_d = c(names(keywords)[1], NA, NA, NA),
+                          construction = c(names(keywords)[2:4], NA), 
+                          standard_equipment = c(names(keywords)[5:8]),
+                          process_equipment = c(names(keywords)[9], NA, NA, NA),
+                          design_and_nre = c(names(keywords)[10:11], NA, NA),
+                          sepm = c(names(keywords)[12:13], NA, NA),
+                          other_labor_and_support = c(names(keywords)[14], NA, NA, NA),
+                          opcs_testing_and_startup = c(names(keywords)[15], NA, NA, NA))
+
+# initialize l1 mapping vector
+l1 <- as.vector(rep("", nrow(spae)))
+
+# map L1 keywords
+for(cat in 1:length(names(l1_keywords))) {
+  print(paste("now mapping:", names(l1_keywords)[cat]))
+  # get vector of words from current keyword category
+  words <- as.vector(l1_keywords[[cat]]) %>% na.omit()
+  # run mapping engine on current keyword category
+  output <- mapping_engine_optimized(spae$l2, words, ignore_case = TRUE)
+  # create vector of category mappings
+  category <- as.vector(output[,2])
+  category[category != ""] <- names(l1_keywords)[cat]
+  # Concatenate identified words and category mappings
+  l1 <- as.vector(paste(l1, category)) %>% str_squish()
+}
+
+# attach identified keywords + L1 mapping to spae DF
+spae$l1 <- l1
+
+# ------------------------------------------------------------------------------
+# ---------- Consolidate multiple mappings into a single l1 cost category ------
+
+# initialize a column in spae place consolidated L1 categorizations. 
+spae$l1_consolidated <- str_trim(spae$l1)
+
+# consolidate all multiple mappings into a since LEVEL 1 category
+spae$l1_consolidated[which(spae$l1_consolidated == "")] <- "Unmapped"
+spae$l1_consolidated[grepl("design_and_nre", spae$l1_consolidated)] <- "design_and_nre"
+spae$l1_consolidated[grepl("process_equipment", spae$l1_consolidated)] <- "process_equipment"
+
+# You can now use these vectors in loops or apply functions based on your needs.
+# employ replace_substrings() function to consolidate L1 mapping
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "construction", "other_labor_and_support", "construction")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "construction", "standard_equipment", "standard_equipment")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "construction", "sepm", "sepm")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "construction", "opcs_testing_and_startup", "opcs_testing_and_startup")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "construction", "d_and_d", "d_and_d")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "other_labor_and_support", "construction", "construction")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "other_labor_and_support", "standard_equipment", "standard_equipment")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "other_labor_and_support", "sepm", "sepm")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "other_labor_and_support", "opcs_testing_and_startup", "opcs_testing_and_startup")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "other_labor_and_support", "d_and_d", "d_and_d")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "standard_equipment", "construction", "standard_equipment")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "standard_equipment", "other_labor_and_support", "standard_equipment")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "standard_equipment", "sepm", "standard_equipment")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "standard_equipment", "opcs_testing_and_startup", "opcs_testing_and_startup")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "standard_equipment", "d_and_d", "standard_equipment")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "sepm", "construction", "sepm")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "sepm", "other_labor_and_support", "sepm")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "sepm", "standard_equipment", "standard_equipment")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "sepm", "d_and_d", "d_and_d")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "sepm", "opcs_testing_and_startup", "sepm")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "opcs_testing_and_startup", "construction", "opcs_testing_and_startup")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "opcs_testing_and_startup", "other_labor_and_support", "opcs_testing_and_startup")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "opcs_testing_and_startup", "standard_equipment", "opcs_testing_and_startup")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "opcs_testing_and_startup", "sepm", "sepm")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "opcs_testing_and_startup", "d_and_d", "d_and_d")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "d_and_d", "construction", "d_and_d")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "d_and_d", "other_labor_and_support", "d_and_d")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "d_and_d", "standard_equipment", "standard_equipment")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "d_and_d", "sepm", "d_and_d")
+spae$l1_consolidated <- replace_substrings(spae$l1_consolidated, "d_and_d", "opcs_testing_and_startup", "d_and_d")
+spae$l1_consolidated <- str_squish(spae$l1_consolidated)
+
+# clean the category mapping up
+spae$l1_consolidated[which(spae$l1_consolidated == "d_and_d")] <- "D&D"
+spae$l1_consolidated[which(spae$l1_consolidated == "construction")] <- "Construction"
+spae$l1_consolidated[which(spae$l1_consolidated == "sepm")] <- "SEPM"
+spae$l1_consolidated[which(spae$l1_consolidated == "opcs_testing_and_startup")] <- "OPC Testing and Startup"
+spae$l1_consolidated[which(spae$l1_consolidated == "design_and_nre")] <- "Design and NRE"
+spae$l1_consolidated[which(spae$l1_consolidated == "process_equipment")] <- "Process Equipment"
+spae$l1_consolidated[which(spae$l1_consolidated == "standard_equipment")] <- "Standard Equipment"
+spae$l1_consolidated[which(spae$l1_consolidated == "other_labor_and_support")] <- "Other Labor and Support"
+
+# Prepare L1 export
+l1_export <- spae %>%
+  select(parsid, wbs, wbs_title, wbs_concat, identified_keywords, l1_consolidated) %>%
+  rename(wbs_name = wbs_title, wbs_name_search_strings = wbs_concat, level_1 = l1_consolidated)
+
+# Prepare L2 export
+l2_export <- spae %>%
+  select(parsid, wbs, wbs_title, wbs_concat, identified_keywords, l2) %>%
+  rename(wbs_name = wbs_title, wbs_name_search_strings = wbs_concat) %>%
+  separate(l2, into = paste0("keyword", 1:(max(str_count(spae$l2, " ")) + 1)), sep = " ", extra = "drop", fill = "right") %>%
+  pivot_longer(cols = starts_with("keyword"), names_to = "level_2_category_index", values_to = "level_2", values_drop_na = TRUE)
+
+# clean the category names in the level 2 data. 
+l2_export$level_2[which(l2_export$level_2 == "")] <- "Unmapped"
+l2_export$level_2[which(l2_export$level_2 == "d_and_d")] <- "D&D"
+l2_export$level_2[which(l2_export$level_2 == "site_preparation")] <- "Site Preparation"
+l2_export$level_2[which(l2_export$level_2 == "primary_facility_construction")] <- "Primary Facility Construction"
+l2_export$level_2[which(l2_export$level_2 == "support_areas_and_facility_construction")] <- "Support Area and Facility Construction"
+l2_export$level_2[which(l2_export$level_2 == "mechanical")] <- "Mechanical"
+l2_export$level_2[which(l2_export$level_2 == "electrical")] <- "Electrical"
+l2_export$level_2[which(l2_export$level_2 == "security")] <- "Security"
+l2_export$level_2[which(l2_export$level_2 == "other_standard_equipment")] <- "Other Standard Equipment"
+l2_export$level_2[which(l2_export$level_2 == "process_equipment")] <- "Process Equipment"
+l2_export$level_2[which(l2_export$level_2 == "facility_design_and_nre")] <- "Facility Design and NRE"
+l2_export$level_2[which(l2_export$level_2 == "process_and_equipment_design_and_nre")] <- "Process and Equipment Design and NRE"
+l2_export$level_2[which(l2_export$level_2 == "system_engineering")] <- "System Engineering"
+l2_export$level_2[which(l2_export$level_2 == "project_management")] <- "Project Management"
+l2_export$level_2[which(l2_export$level_2 == "other_labor_and_support")] <- "Other Labor and Support"
+l2_export$level_2[which(l2_export$level_2 == "opcs_testing_startup")] <- "OPC Testing and Startup"
+l2_export$level_2[which(is.na(l2_export$level_2))] <- "Unmapped"
+
+# Adjust encoding
+l1_export <- l1_export %>% mutate(across(where(is.character), ~ iconv(., "UTF-8", sub = "")))
+l2_export <- l2_export %>% mutate(across(where(is.character), ~ iconv(., "UTF-8", sub = "")))
+
+# ------------------------------------------------------------------------------
+# ---------- Export DFs as CSV and Load to Vega SQL Server ---------------------
+
+# export data as a CSV
+# fwrite(l1_export, paste0("O:/NA-1.3/VEGA/Data_for_SQL/PARS/Other/SPAE_Mapped/2024/", "L1_EVM_export_", as.character(Sys.Date()), ".csv"))
+# fwrite(l2_export, paste0("O:/NA-1.3/VEGA/Data_for_SQL/PARS/Other/SPAE_Mapped/2024/", "L2_EVM_export_", as.character(Sys.Date()), ".csv"))
+
+# Load l1_eport and l2_export into Vega Sql Server
+# DBI::dbWriteTable(con, "pars_spae_l1_mapping", l1_export, overwrite = TRUE, append = FALSE)
+# DBI::dbWriteTable(con, "pars_spae_l2_mapping", l2_export, overwrite = TRUE, append = FALSE)
